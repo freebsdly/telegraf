@@ -1,0 +1,290 @@
+#!/bin/bash
+
+# Purpose: report nmon data to nmon receive server
+# Version: 1.0
+# Auther: qinhj@raysdata.com
+# Create: 2017.12.26
+# Update: 2017.12.27
+
+# set -x
+
+NR_NAME=nmon_reporter
+NR_TEMPDIR=/tmp
+NR_LOCK=""
+NR_NMFILE=""
+NR_DIFF_NUM=0
+NR_DIFF_PREV=0
+NR_DIFF_TOTAL=0
+NR_LOGFILE=""
+NR_FILEDIR=""
+NR_RSERVER=""
+NR_TAGS=""
+NR_WAIT=1    # in AIX 6, need be integer
+NR_RETRY=2
+NR_MATCH_STEP=500
+NR_MATCH_LINENUM=0
+NR_TIMEOUT=3
+# command wrapper
+NR_CMD_ECHO=/usr/bin/echo
+NR_CMD_AWK=/usr/bin/awk
+NR_CMD_WC=/usr/bin/wc
+NR_CMD_GREP=/usr/bin/grep 
+NR_CMD_EXPR=/usr/bin/expr
+NR_CMD_TAIL=/usr/bin/tail
+NR_CMD_CURL=/usr/bin/curl
+NR_CMD_TOUCH=/usr/bin/touch
+NR_CMD_DATE=/usr/bin/date
+NR_CMD_LS=/usr/bin/ls
+NR_CMD_MKTEMP=/usr/bin/mktemp
+NR_CMD_RM=/usr/bin/rm
+NR_CMD_HEAD=/usr/bin/head
+NR_CMD_SLEEP=/usr/bin/sleep
+
+NR_TODAY=`${NR_CMD_DATE} +"%y%m%d"`
+
+nr_diff()
+{
+	NR_DIFF_TOTAL=`${NR_CMD_WC} -l ${NR_NMFILE} | ${NR_CMD_AWK} '{print $1}'`
+	NR_DIFF_PREV=`${NR_CMD_GREP} "DIFF_PREV_TOTAL" ${NR_LOCK}| ${NR_CMD_AWK} -F: '{print $2}'`
+	NR_DIFF_NUM=`${NR_CMD_EXPR} ${NR_DIFF_TOTAL} - ${NR_DIFF_PREV}`
+}
+
+nr_match()
+{
+     match_num=0
+
+     for ((i=1;i<=${NR_RETRY};i++)); do
+         match_num=`${NR_CMD_EXPR} ${match_num} + ${NR_MATCH_STEP}`
+         matchs=(`${NR_CMD_HEAD} -n ${match_num} ${NR_NMFILE} | ${NR_CMD_GREP} "^$1"`)
+         matchs_num=${#matchs[@]}
+         if [ ${matchs_num} -gt 0 ]; then
+             break
+         else
+             continue
+         fi
+     done
+	
+	 ${NR_CMD_ECHO} ${matchs[0]} >> $2
+ }
+
+nr_match_last_zzzz()
+{
+	match_num=0
+
+	for ((i=1;i<=${NR_RETRY};i++)); do
+		match_num=`${NR_CMD_EXPR} ${match_num} + ${NR_MATCH_STEP}`
+		match_zzzzs=(`${NR_CMD_TAIL} -n ${match_num} ${NR_NMFILE} | ${NR_CMD_GREP} -n "^ZZZZ"`)
+		match_znum=${#match_zzzzs[@]}
+		if [ ${match_znum} -gt 0 ]; then
+			break
+		else
+			continue
+		fi
+	done
+
+	match_index=`${NR_CMD_EXPR} ${match_znum} - 1`
+	match_line=${match_zzzzs[${match_index}]}
+	match_linenum=`echo ${match_line} | ${NR_CMD_AWK} -F: '{print $1}'`
+	if [ ${NR_DIFF_TOTAL} -gt ${match_num} ]; then
+		NR_MATCH_LINENUM=`${NR_CMD_EXPR} ${match_num} - ${match_linenum}`
+	else
+		NR_MATCH_LINENUM=`${NR_CMD_EXPR} ${NR_DIFF_TOTAL} - ${match_linenum}`
+	fi
+
+	NR_MATCH_LINENUM=`${NR_CMD_EXPR} ${NR_MATCH_LINENUM} + 1`
+
+}
+
+nr_send()
+{
+	send_tmpfile=`${NR_CMD_MKTEMP}`
+	${NR_CMD_ECHO} ${NR_TAGS} > ${send_tmpfile}
+
+	for((i=1;i<=${NR_RETRY};i++)); do
+		nr_diff
+		if [ $NR_DIFF_NUM -gt 0 ]; then
+			break
+		else
+			${NR_CMD_SLEEP} ${NR_WAIT}
+		fi
+	done
+
+	nr_match_last_zzzz
+
+	${NR_CMD_TAIL} -n ${NR_MATCH_LINENUM} ${NR_NMFILE} |${NR_CMD_GREP} "T[0-9][0-9][0-9][0-9]" >> ${send_tmpfile}
+
+	if ! ${NR_CMD_GREP} -q "^ZZZZ" ${send_tmpfile}; then
+		nr_log "[ERROR]" "no content will be send"
+		exit 1
+	fi
+
+	nr_http_send ${send_tmpfile}
+	${NR_CMD_RM} -f ${send_tmpfile}
+}
+
+nr_tags()
+{
+	NR_TAGS=`${NR_CMD_GREP} "^NR_TAGS" ${NR_LOCK}| ${NR_CMD_AWK} -F: '{print $2}'`
+	if  [ "x${NR_TAGS}" = "x" ]; then
+		tags_num=0
+		tags_step=1000
+		tags_retry=10
+		for((i=1;i<=${tags_retry};i++));do
+			tags_num=`${NR_CMD_EXPR} ${tags_num} + ${tags_step}`
+			tags_zzzzs=(`${NR_CMD_HEAD} -n ${tags_num} ${NR_NMFILE} | ${NR_CMD_GREP} -n "^ZZZZ,T0001"`)
+			if [ x$zzzzs = x ]; then
+				continue
+			else
+				break
+			fi
+		done
+
+		tags_num=`echo $tags_zzzzs| awk -F: '{print $1}'`
+
+		#tags_hostname=`${NR_CMD_HEAD} -n ${tags_num} ${NR_NMFILE} | ${NR_CMD_GREP} "^AAA.host" | ${NR_CMD_AWK} -F, '{print $3}'`
+		tags_net=`${NR_CMD_HEAD} -n ${tags_num} ${NR_NMFILE} | ${NR_CMD_GREP} "^NET,"`
+		tags_netpacket=`${NR_CMD_HEAD} -n ${tags_num} ${NR_NMFILE} | ${NR_CMD_GREP} "^NETPACKET,"`
+		tags_neterror=`${NR_CMD_HEAD} -n ${tags_num} ${NR_NMFILE} | ${NR_CMD_GREP} "^NETERROR,"`
+		tags_netsize=`${NR_CMD_HEAD} -n ${tags_num} ${NR_NMFILE} | ${NR_CMD_GREP} "^NETSIZE,"`
+		tags_jfsfile=`${NR_CMD_HEAD} -n ${tags_num} ${NR_NMFILE} | ${NR_CMD_GREP} "^JFSFILE,"`
+		tags_ioadapt=`${NR_CMD_HEAD} -n ${tags_num} ${NR_NMFILE} | ${NR_CMD_GREP} "^IOADAPT,"`
+		tags_inodes=`${NR_CMD_HEAD} -n ${tags_num} ${NR_NMFILE} | ${NR_CMD_GREP} "^JFSINODE,"`
+		tags_diskbusy=`${NR_CMD_HEAD} -n ${tags_num} ${NR_NMFILE} | ${NR_CMD_GREP} "^DISKBUSY,"`
+		NR_TAGS="JFSFILE=${tags_jfsfile}#SEP#IOADAPT=${tags_ioadapt}#SEP#JFSINODE=${tags_inodes}#SEP#DISKBUSY=${tags_diskbusy}#SEP#NET=${tags_net}#SEP#NETPACKET=${tags_netpacket}#SEP#NETERROR=${tags_neterror}#SEP#NETSIZE=${tags_netsize}"
+	fi
+}
+
+nr_http_send()
+{
+	if ! [ -s $1 ]; then
+		nr_log "[ERROR]" "no content will be send"
+		exit 1
+	fi
+
+	${NR_CMD_CURL} --connect-timeout ${NR_TIMEOUT} -s -XPOST http://${NR_RSERVER}/metrics --data-binary @$1 >/dev/null 2>&1
+}
+
+nr_init()
+{
+	if ! [ -f ${NR_LOGFILE} ]; then
+		${NR_CMD_TOUCH} ${NR_LOGFILE}
+	fi
+
+	if ! [ -f ${NR_LOCK} ]; then
+		${NR_CMD_TOUCH} ${NR_LOCK}
+		nr_stat
+	fi
+
+	nr_getfile
+	nr_tags
+}
+
+nr_stat()
+{
+		${NR_CMD_ECHO} "${NR_NAME} status" > ${NR_LOCK}
+		${NR_CMD_ECHO} "NR_TAGS:${NR_TAGS}" >> ${NR_LOCK}
+		${NR_CMD_ECHO} "DIFF_PREV_TOTAL:${NR_DIFF_TOTAL}" >> ${NR_LOCK}
+}
+
+nr_log()
+{
+		log_now=`${NR_CMD_DATE} +"%Y-%m-%d %H:%M:%S"`
+		${NR_CMD_ECHO} "${log_now} $1 $2" >> ${NR_LOGFILE}
+}
+
+nr_cmdline()
+{
+	if [ ${#@} -eq 0 ]; then
+		nr_usage 1
+	fi
+
+	while getopts "l:s:d:ho:" arg; do
+		case $arg in
+		l)
+			NR_LOGFILE=$OPTARG
+			;;
+		s)
+			NR_RSERVER=$OPTARG
+			;;
+		d)
+			NR_FILEDIR=$OPTARG
+			;;
+		h)
+			nr_usage 0
+			;;
+		o)
+			NR_LOCK=$OPTARG
+			;;
+		esac
+	done
+
+	if [ x${NR_LOGFILE} = x ];then
+		NR_LOGFILE=${NR_TEMPDIR}/${NR_NAME}.log
+	fi
+
+	if [ x${NR_LOCK} = x ]; then
+		NR_LOCK=${NR_TEMPDIR}/${NR_NAME}-${NR_TODAY}.lock
+	fi
+
+	if [ x${NR_RSERVER} = x ];then
+		nr_log "[ERROR]" "remote nmon receive server must be specified"
+		nr_usage 1
+	fi
+
+	# find out which nmon file we should use
+	if [ x${NR_FILEDIR} = x ];then
+		nr_log "[ERROR]" "nmon file directory must be specified"
+		nr_usage 1
+	fi
+
+}
+
+nr_getfile()
+{
+	if ! [ -d ${NR_FILEDIR} ]; then
+		nr_log "[ERROR]" "nmon file directory ${NR_FILEDIR} does not exists" 
+		exit 1
+	fi
+
+	files=(`${NR_CMD_LS} ${NR_FILEDIR}|${NR_CMD_GREP} "_${NR_TODAY}_.*.nmon$"`)
+	if [ ${#files[@]} -eq 0 ];then
+		nr_log "[ERROR]" "can't find ${NR_TODAY} nmon file"
+		exit 1
+	elif [ ${#files[@]} -eq 1 ]; then
+		NR_NMFILE=${NR_FILEDIR}/${files[0]}
+		return 0
+	else
+		# if there are more today files, choose
+		# the max value of the third field of the filename
+		num=-1
+		for file in ${files[@]}; do
+			file_num=`${NR_CMD_ECHO} $file|${NR_CMD_AWK} -F. '{print $1}'|${NR_CMD_AWK} -F_ '{print $3}'`
+			if [ ${file_num} -gt ${num} ]; then
+				num=${file_num}
+			fi
+		done
+
+		NR_NMFILE=${NR_FILEDIR}/`${NR_CMD_LS} ${NR_FILEDIR}| ${NR_CMD_GREP} "${NR_TODAY}_$num.nmon$"`
+	fi
+}
+
+nr_usage()
+{
+	echo "Usage: nmon_reporter [-l logfile] [-o lockfile] -s ip:port -d nmon_file_dir"
+	echo ""
+	echo " -l	the log file path, default $NR_TEMPDIR/$NR_NAME.log"
+	echo " -o	the lock file path, default $NR_TEMPDIR/$NR_NAME.lock"
+	echo " -s	the nmon receive server ip address and port"
+	echo " -d	nmon files directory"
+	echo " -h	help information"
+
+	exit $1
+}
+
+
+
+#############
+nr_cmdline $@
+nr_init
+nr_send
+nr_stat
