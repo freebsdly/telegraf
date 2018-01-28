@@ -16,7 +16,7 @@ ifdef VERSION
 endif
 
 all:
-	$(MAKE) deps
+	#$(MAKE) deps
 	$(MAKE) telegraf
 
 deps:
